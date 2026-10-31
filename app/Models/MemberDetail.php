@@ -1,0 +1,306 @@
+<?php
+
+namespace App\Models;
+
+use Carbon\Carbon;
+use Illuminate\Database\Eloquent\Model;
+
+class MemberDetail extends Model
+{
+    protected $guarded = [];
+
+    protected $casts = [
+        'file_read' => 'array',
+        'pepe_wallet' => 'float',
+        'p2p_wallet' => 'float',
+        'trading_wallet' => 'float',
+    ];
+
+    public function whatsappReferrals()
+    {
+        return $this->hasMany(WhatsappReferral::class, 'member_id', 'memberid');
+    }
+
+    /**
+     * Relationship: Member has many staking details (Package/Activation source).
+     */
+    public function stakingDetails()
+    {
+        return $this->hasMany(StakingDetail::class, 'memberid', 'memberid');
+    }
+
+    /**
+     * Relationship: Member's latest staking detail.
+     */
+    public function latestStakingDetail()
+    {
+        return $this->hasOne(StakingDetail::class, 'memberid', 'memberid')->latestOfMany('created_at');
+    }
+
+    /**
+     * Relationship: Member has many package details (Preserved for other modules).
+     */
+    public function packageDetails()
+    {
+        return $this->hasMany(PackageDetail::class, 'memberid', 'memberid');
+    }
+
+    /**
+     * Relationship: Member's latest package detail.
+     */
+    public function latestPackageDetail()
+    {
+        return $this->hasOne(PackageDetail::class, 'memberid', 'memberid')->latestOfMany();
+    }
+
+    /**
+     * Accessor: Default lock days from active setting.
+     */
+    public function getTradingWalletLockDaysAttribute(): int
+    {
+        return PackageDistribution::getDefaultLockDays();
+    }
+
+    /**
+     * Accessor: Default maximum withdrawal percentage from active setting.
+     * (Feature disabled: Max Withdrawal Percentage cap removed)
+     */
+    // public function getTradingWalletWithdrawalPercentAttribute(): float
+    // {
+    //     return PackageDistribution::getDefaultWithdrawalPercent();
+    // }
+
+    /**
+     * Accessor: Dynamic locked until timestamp.
+     */
+    public function getTradingWalletLockedUntilAttribute(): ?Carbon
+    {
+        return $this->tradingWalletLockedUntil();
+    }
+
+    /**
+     * Get the latest unlock timestamp across member's staking details.
+     */
+    public function tradingWalletLockedUntil(): ?Carbon
+    {
+        $latest = null;
+
+        $stakings = $this->relationLoaded('stakingDetails')
+            ? $this->stakingDetails
+            : $this->stakingDetails()->get();
+
+        foreach ($stakings as $stk) {
+            $unl = $stk->locked_until;
+            if ($unl && (! $latest || $unl->gt($latest))) {
+                $latest = $unl;
+            }
+        }
+
+        $packages = $this->relationLoaded('packageDetails')
+            ? $this->packageDetails
+            : $this->packageDetails()->get();
+
+        foreach ($packages as $pkg) {
+            $unl = $pkg->locked_until;
+            if ($unl && (! $latest || $unl->gt($latest))) {
+                $latest = $unl;
+            }
+        }
+
+        return $latest;
+    }
+
+    /**
+     * Check if the member's trading wallet is currently locked based on staking_details or package_details.
+     */
+    public function isTradingWalletLocked(): bool
+    {
+        $stakings = $this->relationLoaded('stakingDetails')
+            ? $this->stakingDetails
+            : $this->stakingDetails()->get();
+
+        if ($stakings->contains(function ($stk) {
+            return $stk->isLocked();
+        })) {
+            return true;
+        }
+
+        $packages = $this->relationLoaded('packageDetails')
+            ? $this->packageDetails
+            : $this->packageDetails()->get();
+
+        return $packages->contains(function ($pkg) {
+            return $pkg->isLocked();
+        });
+    }
+
+    /**
+     * Get remaining days in the trading wallet lock period.
+     */
+    public function tradingWalletRemainingLockDays(): int
+    {
+        $lockedUntil = $this->tradingWalletLockedUntil();
+        if (! $lockedUntil || now()->gte($lockedUntil)) {
+            return 0;
+        }
+
+        return (int) ceil(now()->diffInSeconds($lockedUntil, false) / 86400);
+    }
+
+    /**
+     * Calculate maximum withdrawable amount from Trading Wallet (using P2P Wallet balance).
+     * (Feature disabled: Max Withdrawal Percentage cap removed - full available balance allowed once unlocked)
+     */
+    public function tradingWalletMaxWithdrawable(): float
+    {
+        if ($this->isTradingWalletLocked()) {
+            return 0.00;
+        }
+
+        // Feature disabled: Max Withdrawal Percentage cap calculation removed.
+        // $percent = PackageDistribution::getDefaultWithdrawalPercent();
+        // $balance = (float) ($this->trading_wallet ?? 0.00);
+        // $max = ($balance * (float) $percent) / 100.00;
+        // return max(0.00, round($max, 2));
+
+        return max(0.00, round((float) ($this->trading_wallet ?? 0.00), 2));
+    }
+
+    /**
+     * Validate Trading Wallet withdrawal request against Lock Period and available balance.
+     */
+    public function canWithdrawTradingWallet(float $amount, ?string &$errorMessage = null): bool
+    {
+        if ($amount <= 0) {
+            $errorMessage = 'Invalid withdrawal amount entered.';
+
+            return false;
+        }
+
+        // CONDITION A: Trading Wallet Lock (sourced from staking_details)
+        if ($this->isTradingWalletLocked()) {
+            $remaining = $this->tradingWalletRemainingLockDays();
+            $until = $this->tradingWalletLockedUntil() ? $this->tradingWalletLockedUntil()->format('d M Y') : 'lock expiry';
+            $errorMessage = "Trading Wallet is locked for {$remaining} more day(s) (until {$until}). Withdrawal is not allowed during the lock period.";
+
+            return false;
+        }
+
+        // Available balance check (sourced from trading_wallet)
+        $balance = (float) ($this->trading_wallet ?? 0.00);
+        if ($amount > $balance) {
+            $errorMessage = 'Requested amount exceeds your available Trading Wallet balance ($'.number_format($balance, 2).').';
+
+            return false;
+        }
+
+        // CONDITION B: Maximum Withdrawal Percentage (Post-lock) - DISABLED
+        // $maxWithdrawable = $this->tradingWalletMaxWithdrawable();
+        // if ($amount > $maxWithdrawable) {
+        //     $percent = PackageDistribution::getDefaultWithdrawalPercent();
+        //     $errorMessage = 'Requested amount ($'.number_format($amount, 2).") exceeds the maximum allowed withdrawal limit of {$percent}% ($".number_format($maxWithdrawable, 2).') from your Trading Wallet.';
+        //     return false;
+        // }
+
+        return true;
+    }
+
+    /**
+     * Check if the member is permitted to purchase or apply for a package.
+     * Every package operates independently with its own individual returns and expiry.
+     * Multiple package purchases are allowed.
+     */
+    public function canPurchasePackage(?string &$errorMessage = null): bool
+    {
+        return true;
+    }
+
+    /**
+     * Apply Trading Wallet Lock and Withdrawal Percentage.
+     * Maintains backwards compatibility without altering member_details schema.
+     */
+    public function applyTradingWalletLock(?int $lockDays = null, ?float $withdrawalPercent = null, ?Carbon $appliedAt = null): void
+    {
+        // Lock calculation is anchored dynamically to staking_details.created_at + PackageDistribution.
+    }
+
+    /**
+     * Check if the member has at least one active staking record in staking_details.
+     */
+    public function hasActiveStaking(): bool
+    {
+        return $this->stakingDetails()->where('status', 'Active')->exists();
+    }
+
+    /**
+     * Check if the member had staking records before, but now has zero active stakings.
+     */
+    public function hasOnlyDeactiveStakings(): bool
+    {
+        $hasAny = $this->stakingDetails()->exists();
+        if (! $hasAny) {
+            return false;
+        }
+
+        return ! $this->stakingDetails()->where('status', 'Active')->exists();
+    }
+
+    /**
+     * Determine dynamic effective status:
+     * - 'Blocked': if explicitly blocked by admin
+     * - 'Active': if member has at least 1 active package in staking_details
+     * - 'Deactive': if member has staking records, but all are Deactive/Expired
+     * - 'Inactive': if member has 0 staking records (newly registered / Temp)
+     */
+    public function getEffectiveStatusAttribute(): string
+    {
+        if ($this->status === 'Blocked') {
+            return 'Blocked';
+        }
+
+        if ($this->hasActiveStaking()) {
+            return 'Active';
+        }
+
+        if ($this->hasOnlyDeactiveStakings()) {
+            return 'Deactive';
+        }
+
+        return ($this->status === 'Temp' || empty($this->status)) ? 'Inactive' : $this->status;
+    }
+
+    /**
+     * Synchronize member_details.status in the database based on staking_details.
+     */
+    public function syncStakingStatus(): string
+    {
+        if ($this->status === 'Blocked') {
+            return 'Blocked';
+        }
+
+        if ($this->hasActiveStaking()) {
+            if ($this->status !== 'Active') {
+                $this->status = 'Active';
+                $this->save();
+            }
+
+            return 'Active';
+        }
+
+        if ($this->hasOnlyDeactiveStakings()) {
+            if ($this->status !== 'Deactive') {
+                $this->status = 'Deactive';
+                $this->save();
+            }
+
+            return 'Deactive';
+        }
+
+        if (empty($this->status) || $this->status === 'Inactive') {
+            $this->status = 'Temp';
+            $this->save();
+        }
+
+        return $this->status ?? 'Temp';
+    }
+}
